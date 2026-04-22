@@ -1,0 +1,67 @@
+name: Build & deploy dashboard
+
+on:
+  # Daily auto-rebuild at 13:05 UTC (~ 9:05 AM ET / 6:05 AM PT)
+  schedule:
+    - cron: '5 13 * * *'
+  # Rebuild whenever the script changes
+  push:
+    branches: [main]
+  # Manual trigger button in the Actions tab
+  workflow_dispatch:
+
+# Allow this workflow to deploy to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid overlapping deploys
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install openpyxl
+
+      - name: Build dashboard + correlation report
+        run: |
+          mkdir -p public
+          # Build the main dashboard (also caches source.xlsx for the next step)
+          python build_dashboard.py public
+          # Build the standalone correlation report against the cached source
+          cp public/source.xlsx . || true
+          python analyze_ivt_rpm.py public || true
+          # Make the dashboard the landing page
+          cp public/kevin_dashboard.html public/index.html
+          # Drop the raw source download from the public output
+          rm -f public/source.xlsx
+          ls -la public/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
