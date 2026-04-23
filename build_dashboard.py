@@ -698,6 +698,47 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <h2 style="font-size:15px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:30px 0 12px;font-weight:600;">Advertiser demand — what advertisers pay per click</h2>
+  <div class="card" style="margin-bottom:18px;">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.55;">
+      <strong style="color:var(--text);">Why this view:</strong>
+      RPM = CTR × CPC. A high-RPM property might just have a clicky audience.
+      <strong style="color:var(--text);">CPC</strong> (revenue per click) is what advertisers are actually willing to pay for this audience —
+      independent of how often users click. The clean-CPC axis discounts for fraud since advertisers will re-bid down on inventory they
+      discover is invalid. Properties on the right with clean (green) inventory and headroom on the volume axis are the strongest scale
+      candidates.
+    </div>
+    <div class="chart-wrap" style="height:440px;"><canvas id="perfDemandScatter"></canvas></div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:12px;color:var(--muted);">
+      <span>One bubble per property.</span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <span style="width:8px;height:8px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
+        <span style="width:14px;height:14px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
+        <span style="width:22px;height:22px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
+        bubble size = revenue captured
+      </span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <span style="width:14px;height:14px;border-radius:50%;background:#f87171;display:inline-block;"></span>
+        <span style="width:14px;height:14px;border-radius:50%;background:#fbbf24;display:inline-block;"></span>
+        <span style="width:14px;height:14px;border-radius:50%;background:#4ade80;display:inline-block;"></span>
+        color = fraud (red 20%+, amber 5–20%, green &lt;5%)
+      </span>
+      <span><strong style="color:var(--good);">Right + green</strong> = strong advertiser demand on clean inventory.
+            <strong style="color:var(--accent);">Right + green + tall</strong> = highest-leverage scale targets.</span>
+    </div>
+  </div>
+
+  <h2 style="font-size:15px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:30px 0 12px;font-weight:600;">Scale candidates — premium demand with headroom</h2>
+  <div class="card" style="margin-bottom:18px;">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.55;">
+      Properties matching all three criteria: <strong style="color:var(--text);">clean CPC in the top half</strong> (advertisers pay a premium),
+      <strong style="color:var(--text);">page views below median</strong> (room to grow without saturating), and
+      <strong style="color:var(--text);">fraud &lt; 10%</strong> (clean enough that scale won't get penalized).
+      The "+~$X at median volume" estimate is what the property would earn if scaled to the network's median volume at its current CPC and CTR.
+    </div>
+    <div id="perfScaleGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;"></div>
+  </div>
+
   <h2 style="font-size:15px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:30px 0 12px;font-weight:600;">Threshold — at what fraud % does RPM drop?</h2>
   <div class="card" style="margin-bottom:18px;">
     <div id="perfThresholdHeadline" style="font-size:15px;line-height:1.55;"></div>
@@ -737,36 +778,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div>
       <div class="chart-wrap" style="height:300px;"><canvas id="perfNdTime"></canvas></div>
       <div style="font-size:12px;color:var(--muted);margin-top:6px;">Same data over time — fraud % (left) and RPM (right).</div>
-    </div>
-  </div>
-
-  <h2 style="font-size:15px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:30px 0 12px;font-weight:600;">Advertiser demand — what advertisers pay per click</h2>
-  <div class="card" style="margin-bottom:18px;">
-    <div style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.55;">
-      <strong style="color:var(--text);">Why this view:</strong>
-      RPM = CTR × CPC. A high-RPM property might just have a clicky audience.
-      <strong style="color:var(--text);">CPC</strong> (revenue per click) is what advertisers are actually willing to pay for this audience —
-      independent of how often users click. The clean-CPC axis discounts for fraud since advertisers will re-bid down on inventory they
-      discover is invalid. Properties on the right with clean (green) inventory and headroom on the volume axis are the strongest scale
-      candidates.
-    </div>
-    <div class="chart-wrap" style="height:440px;"><canvas id="perfDemandScatter"></canvas></div>
-    <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:12px;color:var(--muted);">
-      <span>One bubble per property.</span>
-      <span style="display:flex;align-items:center;gap:6px;">
-        <span style="width:8px;height:8px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
-        <span style="width:14px;height:14px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
-        <span style="width:22px;height:22px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
-        bubble size = revenue captured
-      </span>
-      <span style="display:flex;align-items:center;gap:6px;">
-        <span style="width:14px;height:14px;border-radius:50%;background:#f87171;display:inline-block;"></span>
-        <span style="width:14px;height:14px;border-radius:50%;background:#fbbf24;display:inline-block;"></span>
-        <span style="width:14px;height:14px;border-radius:50%;background:#4ade80;display:inline-block;"></span>
-        color = fraud (red 20%+, amber 5–20%, green &lt;5%)
-      </span>
-      <span><strong style="color:var(--good);">Right + green</strong> = strong advertiser demand on clean inventory.
-            <strong style="color:var(--accent);">Right + green + tall</strong> = highest-leverage scale targets.</span>
     </div>
   </div>
 
@@ -2009,7 +2020,74 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
       `${pstate.from} → ${pstate.to}  ·  ${filtered.length.toLocaleString()} property-day records`;
     renderVerdict(pcomputed); renderLevels(pcomputed); renderThresholdHeadline(pcomputed);
     renderPerfCharts(pcomputed);
+    renderScaleGrid(pcomputed);
     reBin(); reProp(); rePpCorr();
+  }
+
+  // ---- Scale candidates grid: top-half clean CPC + below-median volume + fraud < 10% ----
+  function renderScaleGrid(c) {
+    const grid = document.getElementById("perfScaleGrid");
+    if (!grid) return;
+    const props = c.per_property.filter(p => p.cpc_clean != null);
+    if (props.length < 4) {
+      grid.innerHTML = `<div style="color:var(--muted);font-style:italic;padding:14px;">Not enough properties in this window to identify scale candidates.</div>`;
+      return;
+    }
+    const cpcs = props.map(p => p.cpc_clean).slice().sort((a,b)=>a-b);
+    const vols = props.map(p => p.page_views).slice().sort((a,b)=>a-b);
+    const medCpc = cpcs[Math.floor(cpcs.length/2)];
+    const medVol = vols[Math.floor(vols.length/2)];
+    const candidates = props
+      .filter(p => p.cpc_clean >= medCpc && p.page_views <= medVol && p.fraud_pct < 0.10)
+      .sort((a,b) => b.cpc_clean - a.cpc_clean)
+      .slice(0, 8);
+    if (!candidates.length) {
+      grid.innerHTML = `<div style="color:var(--muted);font-style:italic;padding:14px;">
+        No properties match all three criteria (top-half CPC + below-median volume + fraud &lt; 10%) in this window.
+        Try widening the date range.
+      </div>`;
+      return;
+    }
+    grid.innerHTML = candidates.map(p => {
+      const headroomViews = Math.max(0, medVol - p.page_views);
+      const impliedAddRev = (p.ctr || 0) * p.cpc_clean * headroomViews;
+      const fraudColor = p.fraud_pct < 0.05 ? "var(--good)" :
+        p.fraud_pct < 0.10 ? "var(--warn)" : "var(--bad)";
+      return `<div style="background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:10px;">
+          <div>
+            <div style="font-size:13px;font-weight:600;color:var(--text);line-height:1.3;">${p.label}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px;">${p.oem_group}</div>
+          </div>
+          <span class="pill pos" style="font-size:10px;">SCALE</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px;">
+          <div>
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Clean CPC</div>
+            <div style="font-weight:600;font-variant-numeric:tabular-nums;">$${p.cpc_clean.toFixed(3)}</div>
+          </div>
+          <div>
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">CTR</div>
+            <div style="font-weight:600;font-variant-numeric:tabular-nums;">${p.ctr!=null?(p.ctr*100).toFixed(2)+"%":"—"}</div>
+          </div>
+          <div>
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Volume</div>
+            <div style="font-weight:600;font-variant-numeric:tabular-nums;">${Math.round(p.page_views).toLocaleString()}</div>
+          </div>
+          <div>
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Fraud</div>
+            <div style="font-weight:600;font-variant-numeric:tabular-nums;color:${fraudColor};">${(p.fraud_pct*100).toFixed(2)}%</div>
+          </div>
+          <div style="grid-column:1 / -1;border-top:1px solid var(--line);padding-top:8px;margin-top:4px;">
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Current revenue / scaled potential</div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:2px;">
+              <span style="font-weight:600;font-variant-numeric:tabular-nums;">$${Math.round(p.ad_revenue).toLocaleString()}</span>
+              <span style="color:var(--good);font-size:11px;font-variant-numeric:tabular-nums;">+~$${Math.round(impliedAddRev).toLocaleString()} at median volume</span>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }).join("");
   }
 
   let inited = false;
