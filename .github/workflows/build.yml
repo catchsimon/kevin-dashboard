@@ -1,9 +1,10 @@
 name: Build & deploy dashboard
 
 on:
-  # Daily auto-rebuild at 13:05 UTC (~ 9:05 AM ET / 6:05 AM PT)
+  # Daily auto-rebuild at 17:00 UTC = 9:00 AM PST (= 10:00 AM PDT in summer).
+  # Cron is always UTC; it doesn't auto-adjust for daylight saving.
   schedule:
-    - cron: '5 13 * * *'
+    - cron: '0 17 * * *'
   # Rebuild whenever the script changes
   push:
     branches: [main]
