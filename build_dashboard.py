@@ -28,6 +28,15 @@ SHEET_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 )
 
+# Secondary workbook: Publisher Conversion Score (PCS) comparison report.
+# Sheet has one tab with two columns — current period score + prior period score.
+# Period labels are read from the column headers so the UI stays accurate as
+# the report is refreshed.
+PCS_SHEET_ID = "1bf_JzVW4DMcXMAl1vD10gsdj8cImsmoRo9uE1K_jdws"
+PCS_SHEET_URL = (
+    f"https://docs.google.com/spreadsheets/d/{PCS_SHEET_ID}/export?format=xlsx"
+)
+
 # Tabs to ignore for the property-revenue rollup
 NON_PROPERTY_TABS = {
     "Revenue",
@@ -136,35 +145,81 @@ def property_key(tab_name: str) -> str:
 # ETL
 # ---------------------------------------------------------------------------
 
-def download_sheet(dest_path: Path) -> None:
+def download_sheet(dest_path: Path, url: str = SHEET_URL) -> None:
     print(f"[etl] downloading source sheet -> {dest_path}", file=sys.stderr)
-    req = urllib.request.Request(SHEET_URL, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = resp.read()
     dest_path.write_bytes(data)
 
 
 def parse_property_tab(ws) -> list[dict]:
-    """Parse a single property tab into a list of daily rows."""
+    """Parse a single property tab into a list of daily rows.
+
+    Most tabs have a single table starting at column A. A handful of newer OEM2
+    tabs (My Fimap, Zenity, Realmfeed, Sparkdaily, Local Pulse) have three
+    tables side-by-side — two exploratory layouts on the left and the real
+    data in the rightmost block. We locate every 'Date' header cell in the
+    first few rows, then pick the one with the most date-valued rows below it
+    (ties prefer the variant that has 'Ad Revenue' immediately to its right —
+    the standard schema signature).
+    """
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
 
-    # Find the header row — the row that starts with "Date" in col A
-    header_idx = None
+    # Scan the top rows for every 'Date' header occurrence.
+    candidates: list[tuple[int, int]] = []  # (header_row, date_col)
     for i, r in enumerate(rows[:5]):
-        if r and isinstance(r[0], str) and r[0].strip().lower() == "date":
-            header_idx = i
-            break
-    if header_idx is None:
+        if not r:
+            continue
+        for ci, cell in enumerate(r):
+            if isinstance(cell, str) and cell.strip().lower() == "date":
+                candidates.append((i, ci))
+    if not candidates:
         return []
 
-    headers = [str(c).strip() if c is not None else "" for c in rows[header_idx]]
-    col = {h: i for i, h in enumerate(headers) if h}
+    def score(header_idx: int, date_col: int) -> tuple[int, int]:
+        """Return (data_row_count, schema_bonus) — higher is better."""
+        count = 0
+        for r in rows[header_idx + 1:]:
+            if r and date_col < len(r) and to_date(r[date_col]):
+                count += 1
+        # Bonus if the column to the right of 'Date' is 'Ad Revenue'.
+        hdr = rows[header_idx]
+        next_cell = hdr[date_col + 1] if date_col + 1 < len(hdr) else None
+        schema_bonus = 1 if (isinstance(next_cell, str)
+                             and next_cell.strip().lower() == "ad revenue") else 0
+        return (count, schema_bonus)
+
+    header_idx, date_col = max(candidates, key=lambda c: score(*c))
+    if score(header_idx, date_col)[0] == 0:
+        return []
+
+    # Build the column map scoped to this table — start at date_col and stop
+    # at the next 'Date' header (or end of row). That prevents duplicate names
+    # from neighboring tables shadowing our schema.
+    hdr = rows[header_idx]
+    end = len(hdr)
+    for ci in range(date_col + 1, len(hdr)):
+        cell = hdr[ci]
+        if isinstance(cell, str) and cell.strip().lower() == "date":
+            end = ci
+            break
+    col: dict[str, int] = {}
+    for ci in range(date_col, end):
+        cell = hdr[ci]
+        if cell is None:
+            continue
+        name = str(cell).strip()
+        if name and name not in col:
+            col[name] = ci
 
     out = []
     for r in rows[header_idx + 1:]:
-        d = to_date(r[0]) if r else None
+        if not r or date_col >= len(r):
+            continue
+        d = to_date(r[date_col])
         if not d:
             continue
 
@@ -286,10 +341,199 @@ def build_domain_property_map(
 
 
 # ---------------------------------------------------------------------------
+# Publisher Conversion Score (PCS) — secondary workbook
+# ---------------------------------------------------------------------------
+#
+# The PCS report is a single sheet with two "Publisher Conversion Score"
+# columns: the current period and a prior period for week-over-week reference.
+# Column headers carry the date ranges (e.g. "Publisher Conversion Score April
+# 13th-22nd" and "Publisher Conversion Score (March 30th-April 5th)") — we
+# read those labels and flow them through to the UI so the dashboard stays
+# in sync as the source is refreshed.
+
+
+def _strip_publisher_prefix(desc: str) -> str:
+    """Strip the 'Userwave - OEM Network N -' prefix from a publisher description."""
+    if not isinstance(desc, str):
+        return ""
+    s = desc.strip()
+    # e.g. "Userwave - OEM Network 4 - Daily Wire" -> "Daily Wire"
+    s = re.sub(
+        r"^userwave\s*[-–]\s*oem\s*network\s*\d+\s*[-–]?\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return s.strip(" -")
+
+
+def _extract_period_label(header: str) -> str:
+    """Pull the period text out of a PCS column header. Returns a clean label.
+
+    'Publisher Conversion Score April 13th-22nd'            -> 'April 13th-22nd'
+    'Publisher Conversion Score (March 30th-April 5th)'     -> 'March 30th-April 5th'
+    """
+    s = str(header).strip()
+    s = re.sub(r"(?i)^publisher\s+conversion\s+score\s*", "", s)
+    s = s.strip().strip("()").strip()
+    return s or "PCS"
+
+
+def parse_pcs_workbook(pcs_xlsx: Path) -> dict:
+    """Parse the PCS comparison sheet. Returns dict with:
+        tab_label, period_current, period_prior,
+        rows=[{publisher, publisher_short, publisher_url, pcs_current, pcs_prior}]
+    """
+    wb = openpyxl.load_workbook(pcs_xlsx, data_only=True, read_only=False)
+    if not wb.sheetnames:
+        return {"tab_label": None, "period_current": None, "period_prior": None, "rows": []}
+
+    # One tab per report; take the first populated one.
+    ws = None
+    for name in wb.sheetnames:
+        sh = wb[name]
+        if sh.max_row and sh.max_column:
+            ws = sh
+            break
+    if ws is None:
+        return {"tab_label": None, "period_current": None, "period_prior": None, "rows": []}
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {"tab_label": ws.title, "period_current": None, "period_prior": None, "rows": []}
+
+    # Resolve header row (row starting with something like 'Publisher - ID').
+    header_idx = None
+    for i, r in enumerate(rows[:5]):
+        if r and isinstance(r[0], str) and "publisher" in r[0].strip().lower():
+            header_idx = i
+            break
+    if header_idx is None:
+        header_idx = 0
+
+    headers = [str(c).strip() if c is not None else "" for c in rows[header_idx]]
+    col = {h.lower(): i for i, h in enumerate(headers) if h}
+
+    def find_col(*needles):
+        for key, idx in col.items():
+            low = key.lower()
+            if all(n in low for n in needles):
+                return idx
+        return None
+
+    i_desc = find_col("publisher", "description")
+    i_url = find_col("publisher", "url")
+
+    # All 'publisher conversion score' columns in left-to-right order.
+    pcs_cols: list[tuple[int, str]] = []  # (col_index, raw_header)
+    for idx, h in enumerate(headers):
+        if h and "conversion score" in h.lower():
+            pcs_cols.append((idx, h))
+
+    if len(pcs_cols) < 1:
+        print("[etl] warning: PCS sheet has no 'Publisher Conversion Score' column", file=sys.stderr)
+        return {"tab_label": ws.title, "period_current": None, "period_prior": None, "rows": []}
+
+    i_current, header_current = pcs_cols[0]
+    i_prior, header_prior = (pcs_cols[1] if len(pcs_cols) >= 2 else (None, ""))
+
+    period_current = _extract_period_label(header_current)
+    period_prior = _extract_period_label(header_prior) if i_prior is not None else None
+
+    out = []
+    for r in rows[header_idx + 1:]:
+        if not r or i_desc is None or i_desc >= len(r):
+            continue
+        desc = r[i_desc]
+        if not isinstance(desc, str) or not desc.strip():
+            continue
+        url = r[i_url] if (i_url is not None and i_url < len(r)) else None
+        cur = to_float(r[i_current]) if i_current < len(r) else None
+        prv = (to_float(r[i_prior]) if (i_prior is not None and i_prior < len(r)) else None)
+        out.append({
+            "publisher": desc.strip(),
+            "publisher_short": _strip_publisher_prefix(desc),
+            "publisher_url": (url or "").strip() if isinstance(url, str) else url,
+            "pcs_current": cur,
+            "pcs_prior": prv,
+        })
+    return {
+        "tab_label": ws.title,
+        "period_current": period_current,
+        "period_prior": period_prior,
+        "rows": out,
+    }
+
+
+def build_pcs_property_map(
+    property_tab_names: list[str],
+    pcs_rows: list[dict],
+) -> tuple[dict[str, dict], list[dict]]:
+    """Join PCS rows to property tabs. Returns (map keyed by property_tab, unmatched rows)."""
+    # Same approach as IVT: normalize both sides, exact key first, then overrides,
+    # then substring match.
+    overrides = {
+        # publisher short name (normalized) -> property tab name
+        "clickticks": "OEM5- Click Ticks ",
+        "dailydash": "OEM4 -Daily Dash ",
+        "starthubs": "OEM4 - Starthubs ",
+        "startpage": "OEM4 - Startpage ",
+        "spendider": "OEM5 - Spendider ",
+        "swiftnavi": "OEM4 - Swiftnavi ",
+        "promptnavi": "OEM4 - Promptnavi ",
+        "easynav": "OEM5 - Easynav ",
+        "naviseeking": "OEM4 - Naviseeking ",
+        "navitravel": "OEM4 - Navitravel ",
+    }
+    prop_keys = {property_key(t): t for t in property_tab_names}
+
+    mapping: dict[str, dict] = {}
+    unmatched: list[dict] = []
+    for row in pcs_rows:
+        short = row.get("publisher_short") or row.get("publisher") or ""
+        key = re.sub(r"[^a-z0-9]", "", short.lower())
+        url = row.get("publisher_url") or ""
+        url_key = domain_root(url) if isinstance(url, str) else ""
+
+        match_tab = None
+        # 1. exact short-name key
+        if key and key in prop_keys:
+            match_tab = prop_keys[key]
+        # 2. exact URL root key
+        elif url_key and url_key in prop_keys:
+            match_tab = prop_keys[url_key]
+        # 3. overrides (by short name)
+        elif key in overrides and overrides[key] in property_tab_names:
+            match_tab = overrides[key]
+        elif url_key in overrides and overrides[url_key] in property_tab_names:
+            match_tab = overrides[url_key]
+        else:
+            # 4. substring fuzzy
+            for candidate in (key, url_key):
+                if not candidate:
+                    continue
+                best = None
+                for k, tab in prop_keys.items():
+                    if candidate in k or k in candidate:
+                        if best is None or abs(len(k) - len(candidate)) < abs(len(best[0]) - len(candidate)):
+                            best = (k, tab)
+                if best:
+                    match_tab = best[1]
+                    break
+
+        if match_tab:
+            # Keep first-seen (tab list isn't expected to have dupes, but be safe).
+            mapping.setdefault(match_tab, row)
+        else:
+            unmatched.append(row)
+    return mapping, unmatched
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def build(source_xlsx: Path, output_html: Path) -> dict:
+def build(source_xlsx: Path, output_html: Path, pcs_xlsx: Path | None = None) -> dict:
     wb = openpyxl.load_workbook(source_xlsx, data_only=True, read_only=False)
 
     revenue_rows: list[dict] = []
@@ -366,6 +610,52 @@ def build(source_xlsx: Path, output_html: Path) -> dict:
         })
     perf_dates = sorted({r["date"] for r in performance_pairs})
 
+    # ----- PCS (Publisher Conversion Score) from secondary workbook -----
+    pcs_payload: dict = {
+        "tab_label": None, "period_current": None, "period_prior": None,
+        "by_property": {}, "unmatched": [],
+    }
+    if pcs_xlsx is not None:
+        try:
+            pcs_raw = parse_pcs_workbook(pcs_xlsx)
+            pcs_map, pcs_unmatched = build_pcs_property_map(
+                list(property_meta.keys()), pcs_raw["rows"]
+            )
+            pcs_payload = {
+                "tab_label": pcs_raw["tab_label"],
+                "period_current": pcs_raw["period_current"],
+                "period_prior": pcs_raw["period_prior"],
+                "source_url": f"https://docs.google.com/spreadsheets/d/{PCS_SHEET_ID}/edit",
+                "by_property": {
+                    tab: {
+                        "publisher": row.get("publisher"),
+                        "publisher_short": row.get("publisher_short"),
+                        "publisher_url": row.get("publisher_url"),
+                        "pcs_current": row.get("pcs_current"),
+                        "pcs_prior": row.get("pcs_prior"),
+                    }
+                    for tab, row in pcs_map.items()
+                },
+                "unmatched": [
+                    {
+                        "publisher": r.get("publisher"),
+                        "publisher_short": r.get("publisher_short"),
+                        "publisher_url": r.get("publisher_url"),
+                        "pcs_current": r.get("pcs_current"),
+                        "pcs_prior": r.get("pcs_prior"),
+                    }
+                    for r in pcs_unmatched
+                ],
+            }
+            print(
+                f"[etl] pcs: tab={pcs_raw['tab_label']!r} "
+                f"periods=({pcs_raw['period_current']} | {pcs_raw['period_prior']}) "
+                f"matched={len(pcs_map)} unmatched={len(pcs_unmatched)}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[etl] warning: PCS parse failed: {e}", file=sys.stderr)
+
     payload = {
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "source_url": f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit",
@@ -374,6 +664,7 @@ def build(source_xlsx: Path, output_html: Path) -> dict:
         "properties": list(property_meta.values()),
         "domain_map": domain_map,
         "unmatched_domains": unmatched_domains,
+        "pcs": pcs_payload,
         "date_range": {
             "min": all_dates[0] if all_dates else None,
             "max": all_dates[-1] if all_dates else None,
@@ -485,11 +776,19 @@ HTML_TEMPLATE = r"""<!doctype html>
   .pill.warn { background:rgba(251,191,36,0.18); color:var(--warn); }
   .pill.bad  { background:rgba(248,113,113,0.18); color:var(--bad); }
   .pill.muted{ background:rgba(139,147,167,0.18); color:var(--muted); }
+  .pill.orange{ background:rgba(251,146,60,0.18); color:#fb923c; }
+  .pill.purple{ background:rgba(167,139,250,0.18); color:#a78bfa; }
   .scrollx { overflow-x:auto; max-height:520px; overflow-y:auto;}
   .multiselect { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:6px;
-    max-height:120px; overflow-y:auto; }
+    max-height:160px; overflow-y:auto; }
   .multiselect label { display:flex; align-items:center; gap:6px; padding:2px 4px; font-size:12px; color:var(--text); text-transform:none; letter-spacing:0; margin:0; cursor:pointer;}
   .multiselect label:hover { background:rgba(255,255,255,0.04); border-radius:4px;}
+  .ms-empty { padding:8px 6px; font-size:12px; color:var(--muted); font-style:italic; text-align:center; }
+  .ms-search { width:100%; background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:5px 8px; font:inherit; font-size:12px; margin-bottom:6px;}
+  .ms-search::placeholder { color:var(--muted); }
+  .ms-meta { display:flex; justify-content:space-between; align-items:center; font-size:11px;
+    color:var(--muted); text-transform:none; letter-spacing:0; margin:4px 2px 0; }
   .ms-actions { display:flex; gap:6px; margin-top:6px;}
   .ms-actions button { flex:1; background:var(--panel2); color:var(--muted); border:1px solid var(--line);
     border-radius:6px; padding:4px; cursor:pointer; font-size:11px;}
@@ -522,9 +821,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="filter">
       <label>Date preset</label>
       <div class="preset-buttons" id="presets">
+        <button data-d="yesterday">Yesterday</button>
+        <button data-d="mtd" class="active">Month to date</button>
         <button data-d="7">Last 7d</button>
         <button data-d="14">Last 14d</button>
-        <button data-d="30" class="active">Last 30d</button>
+        <button data-d="30">Last 30d</button>
         <button data-d="90">Last 90d</button>
         <button data-d="all">All</button>
       </div>
@@ -539,7 +840,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
     <div class="filter">
       <label>OEM groups</label>
+      <input type="search" class="ms-search" id="oemGroupsSearch" placeholder="Search OEM groups…" autocomplete="off">
       <div class="multiselect" id="oemGroups"></div>
+      <div class="ms-meta"><span id="oemGroupsCount"></span></div>
       <div class="ms-actions">
         <button data-target="oemGroups" data-act="all">Select all</button>
         <button data-target="oemGroups" data-act="none">Clear</button>
@@ -547,7 +850,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
     <div class="filter">
       <label>Properties</label>
+      <input type="search" class="ms-search" id="propertiesSearch" placeholder="Search properties…" autocomplete="off">
       <div class="multiselect" id="properties"></div>
+      <div class="ms-meta"><span id="propertiesCount"></span></div>
       <div class="ms-actions">
         <button data-target="properties" data-act="all">Select all</button>
         <button data-target="properties" data-act="none">Clear</button>
@@ -589,7 +894,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h3>By property — breakout (revenue + matched IVT)</h3>
+    <h3>
+      By property — breakout (revenue + matched IVT)
+      <span id="pcsWeekBadge" style="text-transform:none;letter-spacing:0;font-weight:400;font-size:12px;color:var(--muted);margin-left:10px;"></span>
+    </h3>
     <div class="scrollx">
       <table id="propTable">
         <thead><tr>
@@ -599,11 +907,14 @@ HTML_TEMPLATE = r"""<!doctype html>
           <th class="num" data-k="ad_revenue">Ad Revenue</th>
           <th class="num" data-k="page_views">Page Views</th>
           <th class="num" data-k="ad_clicks">Ad Clicks</th>
+          <th class="num" data-k="cpc">CPC</th>
           <th class="num" data-k="ctr">CTR</th>
           <th class="num" data-k="rpm">RPM</th>
           <th class="num" data-k="vrpm">vRPM</th>
           <th class="num" data-k="impressions">IVT Impr</th>
           <th class="num" data-k="fraud_pct">Fraud %</th>
+          <th class="num" data-k="pcs_current" id="pcsCurrentHeader">PCS current</th>
+          <th class="num" data-k="pcs_prior" id="pcsPriorHeader">PCS prior</th>
           <th data-k="flag">Flag</th>
         </tr></thead>
         <tbody></tbody>
@@ -879,20 +1190,52 @@ const allProperties = DATA.properties.slice().sort((a,b)=>a.label.localeCompare(
 allOemGroups.forEach(g=>state.oemGroups.add(g));
 allProperties.forEach(p=>state.properties.add(p.tab));
 
-// Render multiselects
+// Render multiselects with search filtering and a live selection counter.
+// Select all / Clear operate on the VISIBLE (currently filtered) subset so you
+// can search a substring and bulk-toggle just those matches.
+const msQuery = { oemGroups: "", properties: "" };
+function visibleItems(id, items, getLabel) {
+  const q = (msQuery[id] || "").trim().toLowerCase();
+  if (!q) return items;
+  return items.filter(it => getLabel(it).toLowerCase().includes(q));
+}
 function renderMultiselect(id, items, getValue, getLabel, set) {
   const root = document.getElementById(id);
   root.innerHTML = "";
-  items.forEach(it=>{
-    const v = getValue(it);
-    const lbl = document.createElement("label");
-    lbl.innerHTML = `<input type="checkbox" ${set.has(v)?"checked":""} value="${v}"> <span>${getLabel(it)}</span>`;
-    lbl.querySelector("input").addEventListener("change", e=>{
-      if (e.target.checked) set.add(v); else set.delete(v);
-      render();
+  const shown = visibleItems(id, items, getLabel);
+  if (!shown.length) {
+    const e = document.createElement("div");
+    e.className = "ms-empty";
+    e.textContent = "No matches";
+    root.appendChild(e);
+  } else {
+    shown.forEach(it => {
+      const v = getValue(it);
+      const lbl = document.createElement("label");
+      lbl.innerHTML = `<input type="checkbox" ${set.has(v)?"checked":""} value="${v}"> <span>${getLabel(it)}</span>`;
+      lbl.querySelector("input").addEventListener("change", e => {
+        if (e.target.checked) set.add(v); else set.delete(v);
+        updateMsCount(id, items, getValue);
+        render();
+      });
+      root.appendChild(lbl);
     });
-    root.appendChild(lbl);
-  });
+  }
+  updateMsCount(id, items, getValue);
+}
+function updateMsCount(id, items, getValue) {
+  const el = document.getElementById(id + "Count");
+  if (!el) return;
+  const setObj = (id === "oemGroups") ? state.oemGroups : state.properties;
+  const total = items.length;
+  const selected = items.filter(it => setObj.has(getValue(it))).length;
+  const q = (msQuery[id] || "").trim();
+  if (q) {
+    const shownCount = visibleItems(id, items, (id === "oemGroups") ? (g=>g) : (p=>`${p.label} (${p.oem_group})`)).length;
+    el.textContent = `${selected} of ${total} selected · ${shownCount} shown`;
+  } else {
+    el.textContent = `${selected} of ${total} selected`;
+  }
 }
 function repaintMultiselects() {
   renderMultiselect("oemGroups", allOemGroups, g=>g, g=>g, state.oemGroups);
@@ -900,16 +1243,28 @@ function repaintMultiselects() {
 }
 repaintMultiselects();
 
+// Search input handlers
+document.getElementById("oemGroupsSearch").addEventListener("input", e => {
+  msQuery.oemGroups = e.target.value;
+  renderMultiselect("oemGroups", allOemGroups, g=>g, g=>g, state.oemGroups);
+});
+document.getElementById("propertiesSearch").addEventListener("input", e => {
+  msQuery.properties = e.target.value;
+  renderMultiselect("properties", allProperties, p=>p.tab, p=>`${p.label} (${p.oem_group})`, state.properties);
+});
+
 document.querySelectorAll('.ms-actions button').forEach(b=>{
   b.addEventListener("click", ()=>{
     const target = b.dataset.target;
     const act = b.dataset.act;
+    // Bulk actions apply to currently-visible items only so the user can
+    // search for a substring and toggle that subset without disturbing the rest.
     if (target==="oemGroups") {
-      state.oemGroups.clear();
-      if (act==="all") allOemGroups.forEach(g=>state.oemGroups.add(g));
+      const vis = visibleItems("oemGroups", allOemGroups, g=>g);
+      vis.forEach(g => act==="all" ? state.oemGroups.add(g) : state.oemGroups.delete(g));
     } else {
-      state.properties.clear();
-      if (act==="all") allProperties.forEach(p=>state.properties.add(p.tab));
+      const vis = visibleItems("properties", allProperties, p=>`${p.label} (${p.oem_group})`);
+      vis.forEach(p => act==="all" ? state.properties.add(p.tab) : state.properties.delete(p.tab));
     }
     repaintMultiselects();
     render();
@@ -922,8 +1277,24 @@ function applyPreset(d) {
   const max = DATA.date_range.max ? new Date(DATA.date_range.max) : new Date();
   const min = DATA.date_range.min ? new Date(DATA.date_range.min) : new Date();
   let from = min, to = max;
-  if (d !== "all") {
-    const days = parseInt(d,10);
+  const key = String(d);
+  if (key === "all") {
+    // from=min, to=max (already set above)
+  } else if (key === "yesterday") {
+    // Calendar yesterday, clamped to the available data window.
+    const y = new Date();
+    y.setDate(y.getDate() - 1);
+    if (y > max) { from = to = max; }
+    else if (y < min) { from = to = min; }
+    else { from = to = y; }
+  } else if (key === "mtd") {
+    // First of the current month (client local) through the latest data.
+    const now = new Date();
+    const first = new Date(now.getFullYear(), now.getMonth(), 1);
+    from = first < min ? min : first;
+    to = max;
+  } else {
+    const days = parseInt(key, 10);
     from = new Date(max);
     from.setDate(from.getDate() - (days - 1));
     if (from < min) from = min;
@@ -1171,16 +1542,21 @@ function render() {
     if (!domainByProp[k]) domainByProp[k] = new Set();
     domainByProp[k].add(r.origin_domain);
   });
+  const pcsByProp = (DATA.pcs && DATA.pcs.by_property) || {};
   const propRows = Object.values(byProp).map(p=>{
     const i = ivtByProp[p.tab] || {impressions:0, fraud:0};
     const fp = i.impressions ? i.fraud/i.impressions : null;
+    const pcs = pcsByProp[p.tab] || {};
     return {
       ...p,
       ctr: p.page_views ? p.ad_clicks/p.page_views : null,
+      cpc: p.ad_clicks ? p.ad_revenue/p.ad_clicks : null,
       rpm: p.page_views ? (p.ad_revenue/p.page_views)*1000 : null,
       vrpm: null,
       impressions: i.impressions,
       fraud_pct: fp,
+      pcs_current: (pcs.pcs_current==null ? null : pcs.pcs_current),
+      pcs_prior:   (pcs.pcs_prior==null   ? null : pcs.pcs_prior),
       domain: domainByProp[p.tab] ? [...domainByProp[p.tab]].join(", ") : "—",
       flag: fp==null ? "—" : (fp>0.2 ? "bad" : fp>0.05 ? "warn" : "good"),
     };
@@ -1194,13 +1570,16 @@ function render() {
       <td class="num">${fmt.money(r.ad_revenue)}</td>
       <td class="num">${fmt.int(r.page_views)}</td>
       <td class="num">${fmt.int(r.ad_clicks)}</td>
+      <td class="num">${r.cpc!=null?"$"+r.cpc.toFixed(3):"—"}</td>
       <td class="num">${fmt.pct(r.ctr)}</td>
       <td class="num">${fmt.num(r.rpm,2)}</td>
       <td class="num">—</td>
       <td class="num">${fmt.int(r.impressions)}</td>
       <td class="num">${pillFraud(r.fraud_pct)}</td>
+      <td class="num">${pcsCell(r.pcs_current)}</td>
+      <td class="num">${pcsCell(r.pcs_prior)}</td>
       <td>${flagPill(r.flag)}</td>
-    </tr>`).join("") : `<tr><td colspan="12" class="empty">No properties in selected filters.</td></tr>`;
+    </tr>`).join("") : `<tr><td colspan="15" class="empty">No properties in selected filters.</td></tr>`;
 
   // ---------- Property × Day matrix ----------
   renderMatrix(rev, ivtMatched);
@@ -1417,9 +1796,50 @@ function flagPill(f) {
   if (f==="good") return `<span class="pill good">OK</span>`;
   return `<span class="pill muted">No IVT match</span>`;
 }
+// PCS = Publisher Conversion Score. Color bands:
+//   < 0.3        red    (underperforming)
+//   0.3 – < 0.5  orange (borderline)
+//   0.5 – 2.1    green  (healthy)
+//   > 2.1        purple (suspiciously high — possible inflation / anomaly)
+function pcsCell(v) {
+  if (v==null) return `<span style="color:var(--muted);">—</span>`;
+  const n = Number(v);
+  let cls;
+  if (n < 0.3) cls = "bad";
+  else if (n < 0.5) cls = "orange";
+  else if (n <= 2.1) cls = "good";
+  else cls = "purple";
+  return `<span class="pill ${cls}">${n.toFixed(2)}</span>`;
+}
 
-// initial render
-applyPreset(30);
+// PCS period badge shown next to the "By property" heading, plus column-header
+// labels that reflect the actual date ranges in the current report.
+(function renderPcsBadge(){
+  const el = document.getElementById("pcsWeekBadge");
+  const pcs = DATA.pcs || {};
+  const url = pcs.source_url;
+  if (el) {
+    if (!pcs.period_current && !pcs.period_prior) {
+      el.textContent = "PCS: no data";
+    } else {
+      const parts = [];
+      if (pcs.period_current) parts.push(`Current: ${pcs.period_current}`);
+      if (pcs.period_prior)   parts.push(`Prior: ${pcs.period_prior}`);
+      const label = `PCS — ${parts.join(" · ")}`;
+      el.innerHTML = url
+        ? `<a href="${url}" target="_blank" style="color:var(--accent);text-decoration:none;">${label}</a>`
+        : label;
+    }
+  }
+  // Update the header cells in the property breakout to show the period text.
+  const h1 = document.getElementById("pcsCurrentHeader");
+  const h2 = document.getElementById("pcsPriorHeader");
+  if (h1 && pcs.period_current) h1.textContent = `PCS ${pcs.period_current}`;
+  if (h2 && pcs.period_prior)   h2.textContent = `PCS ${pcs.period_prior}`;
+})();
+
+// initial render — default to month-to-date
+applyPreset("mtd");
 
 // ============================================================
 // Tab navigation + Performance tab
@@ -1531,10 +1951,12 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
       p.fraud += r.fraud || 0; p.days += 1;
     }
     const per_property = [];
+    const pcsByProp = (DATA.pcs && DATA.pcs.by_property) || {};
     for (const tab of Object.keys(byProp)) {
       const v = byProp[tab];
       const minDays = Math.min(5, dates.length);
       if (v.days < minDays || v.page_views < 1000 || v.impressions < 100) continue;
+      const pcs = pcsByProp[v.tab] || {};
       per_property.push({
         tab:v.tab, label:v.label, oem_group:v.oem_group, days:v.days,
         rpm:(v.ad_revenue/v.page_views)*1000,
@@ -1542,6 +1964,8 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
         fraud_pct: v.fraud/v.impressions,
         ad_revenue:v.ad_revenue, page_views:v.page_views,
         ad_clicks:v.ad_clicks, impressions:v.impressions,
+        pcs_current: (pcs.pcs_current == null ? null : pcs.pcs_current),
+        pcs_prior:   (pcs.pcs_prior   == null ? null : pcs.pcs_prior),
       });
     }
     for (const p of per_property) {
@@ -1773,6 +2197,7 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
             return [`${r.label}`, `Clean CPC: ${r.x!=null?'$'+r.x.toFixed(3):'—'}  (raw $${r.cpc.toFixed(3)})`,
               `Volume: ${Math.round(r.y).toLocaleString()} page views`, `Revenue: $${Math.round(r.rev).toLocaleString()}`,
               `Fraud: ${(r.fraud*100).toFixed(2)}%`, `CTR: ${r.ctr!=null?(r.ctr*100).toFixed(2)+'%':'—'}`,
+              `PCS current: ${r.pcs_current!=null?r.pcs_current.toFixed(2):'—'}  ·  prior: ${r.pcs_prior!=null?r.pcs_prior.toFixed(2):'—'}`,
               `Demand tier: ${r.tier}`];
           }}}},
         scales:{x:{title:{display:true,text:"Clean CPC ($/click)"}, ticks:{callback:v=>"$"+v.toFixed(2)}},
@@ -1903,7 +2328,7 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
       const data = props.filter(p=>p.cpc_clean!=null).map(p=>{
         const r = p.ad_revenue > 0 ? minR + (maxR-minR)*Math.sqrt(p.ad_revenue/maxRev) : minR;
         return {x:p.cpc_clean, y:p.page_views, r, label:p.label, cpc:p.cpc, rev:p.ad_revenue,
-          fraud:p.fraud_pct, ctr:p.ctr, tier:p.demand_tier};
+          fraud:p.fraud_pct, ctr:p.ctr, tier:p.demand_tier, pcs_current:p.pcs_current, pcs_prior:p.pcs_prior};
       });
       pcharts.demandScatter.data.datasets[0].data = data;
       pcharts.demandScatter.data.datasets[0].backgroundColor = data.map(d=>fc(d.fraud)[0]);
@@ -2053,6 +2478,17 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
       const impliedAddRev = (p.ctr || 0) * p.cpc_clean * headroomViews;
       const fraudColor = p.fraud_pct < 0.05 ? "var(--good)" :
         p.fraud_pct < 0.10 ? "var(--warn)" : "var(--bad)";
+      // PCS current — color matches the property breakout bands.
+      let pcsColor = "var(--muted)", pcsText = "—";
+      if (p.pcs_current != null) {
+        const n = Number(p.pcs_current);
+        pcsText = n.toFixed(2);
+        if (n < 0.3) pcsColor = "var(--bad)";
+        else if (n < 0.5) pcsColor = "#fb923c";      // orange
+        else if (n <= 2.1) pcsColor = "var(--good)";
+        else pcsColor = "#a78bfa";                    // purple
+      }
+      const pcsPeriod = (DATA.pcs && DATA.pcs.period_current) ? DATA.pcs.period_current : "current";
       return `<div style="background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:14px;">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:10px;">
           <div>
@@ -2077,6 +2513,10 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
           <div>
             <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Fraud</div>
             <div style="font-weight:600;font-variant-numeric:tabular-nums;color:${fraudColor};">${(p.fraud_pct*100).toFixed(2)}%</div>
+          </div>
+          <div style="grid-column:1 / -1;">
+            <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">PCS · ${pcsPeriod}</div>
+            <div style="font-weight:600;font-variant-numeric:tabular-nums;color:${pcsColor};">${pcsText}</div>
           </div>
           <div style="grid-column:1 / -1;border-top:1px solid var(--line);padding-top:8px;margin-top:4px;">
             <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Current revenue / scaled potential</div>
@@ -2126,12 +2566,19 @@ def main(argv: list[str]) -> int:
     out_dir = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / "source.xlsx"
+    pcs_src = out_dir / "pcs_source.xlsx"
     html = out_dir / "kevin_dashboard.html"
 
     if not (len(argv) > 2 and argv[2] == "--no-download"):
-        download_sheet(src)
+        download_sheet(src, SHEET_URL)
+        # PCS workbook: best-effort; if it fails we still render the dashboard
+        # without the PCS column rather than blocking the refresh.
+        try:
+            download_sheet(pcs_src, PCS_SHEET_URL)
+        except Exception as e:
+            print(f"[etl] warning: PCS workbook download failed: {e}", file=sys.stderr)
 
-    build(src, html)
+    build(src, html, pcs_src if pcs_src.exists() else None)
     return 0
 
 

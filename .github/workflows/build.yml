@@ -47,8 +47,8 @@ jobs:
           python analyze_ivt_rpm.py public || true
           # Make the dashboard the landing page
           cp public/kevin_dashboard.html public/index.html
-          # Drop the raw source download from the public output
-          rm -f public/source.xlsx
+          # Drop the raw source downloads from the public output
+          rm -f public/source.xlsx public/pcs_source.xlsx
           ls -la public/
 
       - name: Upload Pages artifact
